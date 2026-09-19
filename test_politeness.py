@@ -155,3 +155,97 @@ async def test_respect_robots_disallowed_raises():
             await client.get("https://example.com/restricted/data")
 
         assert "disallowed by domain robots.txt" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_nextjs_hydration_json_extraction():
+    """Verify that ContentExtractor extracts article content from Next.js __NEXT_DATA__ JSON."""
+    import json
+    from domain_reader.extractor import ContentExtractor
+
+    sample_article_text = (
+        "Next.js is a flexible React framework that gives you building blocks to create fast, "
+        "full-stack web applications. By framework, we mean Next.js handles the tooling and "
+        "configuration needed for React, and provides additional structure, features, and optimizations for your application."
+    )
+    next_data_payload = {
+        "props": {
+            "pageProps": {
+                "post": {
+                    "title": "Getting Started with Next.js Framework Architecture",
+                    "articleBody": sample_article_text
+                }
+            }
+        }
+    }
+    html_with_next_data = f"""
+    <!DOCTYPE html>
+    <html>
+      <head><title>Loading App...</title></head>
+      <body>
+        <div id="__next"><div id="root"></div></div>
+        <script id="__NEXT_DATA__" type="application/json">
+          {json.dumps(next_data_payload)}
+        </script>
+      </body>
+    </html>
+    """
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=html_with_next_data, request=request)
+
+    mock_transport = httpx.MockTransport(mock_handler)
+    async with HardenedClient(transport=mock_transport) as client:
+        extractor = ContentExtractor(client)
+        result = await extractor.extract("https://example.com/blog/intro")
+
+        assert result.extraction_method == "hydration_json"
+        assert result.title == "Getting Started with Next.js Framework Architecture"
+        assert "flexible React framework" in result.content
+        assert result.is_spa_shell is False
+
+
+@pytest.mark.asyncio
+async def test_json_ld_schema_org_extraction():
+    """Verify that ContentExtractor extracts article content from Schema.org JSON-LD tags."""
+    import json
+    from domain_reader.extractor import ContentExtractor
+
+    sample_news_text = (
+        "In a landmark development for autonomous agent infrastructure, open-source engineers "
+        "have deployed zero-latency ingress airlocks that strip untrusted web tracking pixels "
+        "and isolate indirect prompt injections directly at the socket level."
+    )
+    json_ld_payload = {
+        "@context": "https://schema.org",
+        "@type": "NewsArticle",
+        "headline": "Autonomous Ingress Airlocks Deployed Across Enterprise Clusters",
+        "articleBody": sample_news_text
+    }
+    html_with_json_ld = f"""
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <script type="application/ld+json">
+          {json.dumps(json_ld_payload)}
+        </script>
+      </head>
+      <body>
+        <div id="app"></div>
+      </body>
+    </html>
+    """
+
+    async def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=html_with_json_ld, request=request)
+
+    mock_transport = httpx.MockTransport(mock_handler)
+    async with HardenedClient(transport=mock_transport) as client:
+        extractor = ContentExtractor(client)
+        result = await extractor.extract("https://example.com/article-123")
+
+        assert result.extraction_method in ("hydration_json", "trafilatura")
+        assert result.title == "Autonomous Ingress Airlocks Deployed Across Enterprise Clusters"
+        assert "landmark development for autonomous agent" in result.content
+        assert result.is_spa_shell is False
+

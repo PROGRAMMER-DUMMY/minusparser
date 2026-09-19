@@ -1,9 +1,10 @@
 import html
+import json
 import logging
 import re
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 from bs4 import BeautifulSoup
 import trafilatura
@@ -107,13 +108,32 @@ class ContentExtractor:
                 content = self._strip_html_fallback(html_content)
                 fmt = 'text'
 
+            # Hydration JSON Fallback: Check for Next.js (__NEXT_DATA__), JSON-LD, or window state
+            if not content or len(content.strip()) < 200:
+                hydrated_content, hydrated_title = self._extract_hydration_content(html_content)
+                if hydrated_content and len(hydrated_content.strip()) >= 150:
+                    content = hydrated_content
+                    method = 'hydration_json'
+                    fmt = 'markdown' if prefer_markdown else 'text'
+                    if hydrated_title and not title:
+                        title = hydrated_title
+
             try:
-                # Attempt to extract title
-                meta = trafilatura.bare_extraction(html_content)
-                if meta and isinstance(meta, dict) and 'title' in meta:
-                    title = meta['title']
+                # Attempt to extract title if not yet resolved
+                if not title:
+                    meta = trafilatura.bare_extraction(html_content)
+                    if meta and isinstance(meta, dict) and 'title' in meta:
+                        title = meta['title']
+                if not title:
+                    _, hydrated_title = self._extract_hydration_content(html_content)
+                    if hydrated_title:
+                        title = hydrated_title
+                    else:
+                        soup_tag = BeautifulSoup(html_content, "html.parser").find("title")
+                        if soup_tag and soup_tag.string:
+                            title = soup_tag.string.strip()
             except Exception as e:
-                logger.warning(f"trafilatura bare_extraction failed for {url}: {e}")
+                logger.warning(f"Title extraction failed for {url}: {e}")
 
         # Run content through comprehensive Smart Guardrails
         try:
@@ -285,6 +305,150 @@ class ContentExtractor:
         no_tags = re.sub(r'<[^>]+>', ' ', no_script)
         decoded = html.unescape(no_tags)
         return decoded.strip()
+
+    @classmethod
+    def _search_dict_for_content(cls, data: Any, depth: int = 0) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Recursively search nested dictionary/list structures from SPA state for article text and title.
+        """
+        if depth > 8 or not data:
+            return None, None
+
+        found_title: Optional[str] = None
+        candidates: list[Tuple[int, str]] = []
+
+        def _scan(obj: Any, current_depth: int):
+            nonlocal found_title
+            if current_depth > 8 or not obj:
+                return
+
+            if isinstance(obj, dict):
+                # Search title if not found yet
+                if not found_title:
+                    for k in ("title", "headline", "name", "articleTitle", "postTitle"):
+                        val = obj.get(k)
+                        if isinstance(val, str) and 4 < len(val.strip()) < 200:
+                            found_title = val.strip()
+                            break
+
+                # Search content keys
+                for k in ("articleBody", "body", "content", "markdown", "text", "html", "post", "story"):
+                    val = obj.get(k)
+                    if isinstance(val, str):
+                        cleaned = val.strip()
+                        if len(cleaned) > 200:
+                            candidates.append((len(cleaned), cleaned))
+                    elif isinstance(val, (dict, list)):
+                        _scan(val, current_depth + 1)
+
+                # Scan remaining dict entries
+                for k, v in obj.items():
+                    if isinstance(v, (dict, list)):
+                        _scan(v, current_depth + 1)
+
+            elif isinstance(obj, list):
+                for elem in obj:
+                    _scan(elem, current_depth + 1)
+
+        _scan(data, depth)
+
+        if not candidates:
+            return found_title, None
+
+        # Pick the largest text candidate
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_content = candidates[0][1]
+
+        # If it contains HTML markup, convert to clean text/markdown via trafilatura
+        if "<p>" in best_content.lower() or "<div" in best_content.lower() or "<br" in best_content.lower():
+            try:
+                extracted_md = trafilatura.extract(
+                    best_content,
+                    output_format="markdown",
+                    include_comments=False,
+                    include_tables=True,
+                )
+                if extracted_md and len(extracted_md.strip()) > 100:
+                    best_content = extracted_md
+            except Exception:
+                pass
+
+        return found_title, best_content
+
+    @classmethod
+    def _extract_hydration_content(cls, html_content: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Extract substantive article text from embedded SPA hydration JSON payloads:
+        1. JSON-LD Schema.org (<script type="application/ld+json">)
+        2. Next.js payload (<script id="__NEXT_DATA__" type="application/json">)
+        3. Nuxt/Remix/Redux window state (window.__INITIAL_STATE__, window.__PRELOADED_STATE__)
+
+        Returns:
+            Tuple of (extracted_text_or_markdown, extracted_title).
+        """
+        if not html_content:
+            return None, None
+
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # 1. JSON-LD Schema.org tags
+        for ld_tag in soup.find_all("script", type="application/ld+json"):
+            if not ld_tag.string:
+                continue
+            try:
+                data = json.loads(ld_tag.string.strip())
+                items = []
+                if isinstance(data, list):
+                    items = data
+                elif isinstance(data, dict):
+                    if "@graph" in data and isinstance(data["@graph"], list):
+                        items = data["@graph"]
+                    else:
+                        items = [data]
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = str(item.get("@type", ""))
+                    if any(t in item_type for t in ("Article", "BlogPosting", "NewsArticle", "TechArticle", "WebPage")):
+                        title = item.get("headline") or item.get("name")
+                        body = item.get("articleBody") or item.get("text")
+                        if body and len(str(body).strip()) > 150:
+                            return str(body).strip(), str(title) if title else None
+            except Exception:
+                continue
+
+        # 2. Next.js __NEXT_DATA__
+        next_tag = soup.find("script", id="__NEXT_DATA__")
+        if next_tag and next_tag.string:
+            try:
+                data = json.loads(next_tag.string.strip())
+                page_props = data.get("props", {}).get("pageProps", {})
+                title, content = cls._search_dict_for_content(page_props)
+                if content and len(content.strip()) > 150:
+                    return content.strip(), title
+            except Exception:
+                pass
+
+        # 3. window.__INITIAL_STATE__ / window.__PRELOADED_STATE__ / window.__remixContext
+        patterns = [
+            r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});\s*(?:</script>|var|let|const|\n)',
+            r'window\.__PRELOADED_STATE__\s*=\s*(\{.*?\});\s*(?:</script>|var|let|const|\n)',
+            r'window\.__remixContext\s*=\s*(\{.*?\});\s*(?:</script>|var|let|const|\n)',
+        ]
+        for pat in patterns:
+            match = re.search(pat, html_content, re.DOTALL)
+            if match:
+                try:
+                    json_str = match.group(1).strip()
+                    data = json.loads(json_str)
+                    title, content = cls._search_dict_for_content(data)
+                    if content and len(content.strip()) > 150:
+                        return content.strip(), title
+                except Exception:
+                    continue
+
+        return None, None
 
     @staticmethod
     def _detect_spa_shell(substantive_text: str, raw_html: str = "") -> tuple[bool, Optional[str]]:
